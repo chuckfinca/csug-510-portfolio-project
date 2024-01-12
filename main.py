@@ -2,12 +2,15 @@ import json
 import random
 import time
 import sklearn.model_selection
+import sklearn.datasets
 from enum import Enum
 
-import matplotlib.pyplot as matplotlib_pyplot
+from xgboost import XGBClassifier
+# read data
+
+import matplotlib.pyplot
 import numpy
 from graphviz import Digraph
-import torch
 
 
 class Operation(Enum):
@@ -220,15 +223,19 @@ class Value:
     def _gradient_descent(self, step_size):
         self.data += step_size * self.gradient_with_respect_to_loss
 
-    def back_propagation(self, perform_gradient_descent: bool):
-        # Initialize the gradient of the loss function as 1
-        self.gradient_with_respect_to_loss = 1
-
+    def back_propagation(self, perform_gradient_descent: bool, step_size):
         # Backpropagation: iterate over the graph in reverse (from outputs to inputs)
 
         # Sort the graph in topological order to ensure proper gradient propagation
         # Essential for correctly applying the chain rule in backpropagation.
         topologically_sorted_graph = topological_sort(self)
+
+        # reset gradients
+        for value in topologically_sorted_graph:
+            value.gradient_with_respect_to_loss = 0
+
+        # Initialize the gradient of the loss function as 1
+        self.gradient_with_respect_to_loss = 1
 
         # At each node, apply the chain rule to calculate and accumulate gradients.
         for node in reversed(topologically_sorted_graph):
@@ -236,7 +243,7 @@ class Value:
 
             if perform_gradient_descent and node is not self:
                 # gradient descent
-                node._gradient_descent(step_size=0.001)
+                node._gradient_descent(step_size)
 
 
 def topological_sort(value: Value) -> ['Value']:
@@ -444,28 +451,162 @@ class MultilayerFullyConnectedNetwork:
             return MultilayerFullyConnectedNetwork(None, None, state)
 
 
+def compute_validation_loss(network, validation_inputs, validation_targets):
+    total_loss = 0
+    for x, y in zip(validation_inputs, validation_targets):
+        prediction = network(x)
+        loss = prediction.binary_cross_entropy(y)
+        total_loss += loss.data
+    average_loss = total_loss / len(validation_inputs)
+    return average_loss
+
+
+
+def plot_losses(training_losses, validation_losses):
+    matplotlib.pyplot.figure(figsize=(10, 6))
+    matplotlib.pyplot.plot(training_losses, label='Training Loss')
+    matplotlib.pyplot.plot(validation_losses, label='Validation Loss')
+    matplotlib.pyplot.xlabel('Epoch')
+    matplotlib.pyplot.ylabel('Loss')
+    matplotlib.pyplot.title('Training and Validation Loss Over Epochs')
+    matplotlib.pyplot.legend()
+    matplotlib.pyplot.show()
+
+
+def xgboost(x_train, x_validate, y_train, y_validate):
+    # create model instance
+    model = XGBClassifier(n_estimators=2, max_depth=2, learning_rate=1, objective='binary:logistic')
+    # fit model
+    model.fit(x_train, y_train)
+    # make predictions
+    y_preds = model.predict(x_validate)
+
+    number_correct = 0
+    for y_pred, y_true in zip(y_preds, y_validate):
+        if y_pred == y_true:
+            number_correct += 1
+
+    accuracy = number_correct / len(x_validate)
+    print(f"Accuracy: {accuracy * 100}%")
+
+    weight_booster = model.get_booster().get_score(importance_type='weight')
+    gain_booster = model.get_booster().get_score(importance_type='gain')
+    cover_booster = model.get_booster().get_score(importance_type='cover')
+    # weight_booster = model.get_booster().get_score(importance_type='weight')
+    print("asdf")
+
+    return model
+
+
+def train(model, x_train, x_validate, y_train, y_validate):
+
+    training_losses = []
+    validation_losses = []
+
+    for epoch in range(4):
+        epoch_start = time.time()
+
+        total_epoch_loss = 0
+
+        # Training loop
+        for (index, x) in enumerate(x_train):
+            y = y_train[index]
+
+            out = model(x)
+            loss = out.binary_cross_entropy(y)
+
+            loss.back_propagation(perform_gradient_descent=True, step_size=0.00001)
+
+            total_epoch_loss += loss.data
+
+        # Calculate the average loss for this epoch
+        average_training_loss = total_epoch_loss / len(x_train)
+
+        # Append the average loss to the training_losses list
+        training_losses.append(average_training_loss)
+
+        # Calculate validation loss and append to validation_losses
+        validation_loss = compute_validation_loss(model, x_validate, y_validate)
+        validation_losses.append(validation_loss)
+
+        print(
+            f"Epoch {epoch + 1}, Training Loss: {total_epoch_loss}, Validation Loss: {validation_loss} in {time.time() - epoch_start} seconds")
+
+    model.save_to_file(f"network_{time.time()}.txt")
+    plot_losses(training_losses, validation_losses)
+
+
+def apply_binary_threshold(probabilities, threshold):
+    predictions = []
+    for probability in probabilities:
+        if probability >= threshold:
+            predictions.append(1)
+        else:
+            predictions.append(0)
+    return predictions
+
+
 
 if __name__ == '__main__':
 
-    start = time.time()
+    start_time = time.time()
 
     training_data_x = numpy.genfromtxt('kaggle_dsl_scikit_learn/train.csv', delimiter=',')
     training_data_y = numpy.genfromtxt('kaggle_dsl_scikit_learn/trainLabels.csv', delimiter=',')
 
     x_train, x_validate, y_train, y_validate = sklearn.model_selection.train_test_split(training_data_x, training_data_y, test_size=0.10, random_state=42)
 
+    mfcn = MultilayerFullyConnectedNetwork.load_from_file("network_1705010672.034891.txt")
+    # mfcn = MultilayerFullyConnectedNetwork(x_train.shape[0], [40, 100, 100, 20, 1])
 
-    mfcn = MultilayerFullyConnectedNetwork.load_from_file("network_state.txt")
+    # train(mfcn, x_train, x_validate, y_train, y_validate)
 
-    # mfcn = MultilayerFullyConnectedNetwork(x.shape[0], [10, 10, 10, 1])
-    for (index, x) in enumerate(x_train):
-        y = y_train[index]
 
-        out = mfcn(x)
-        loss = out.binary_cross_entropy(y)
+    test_x = numpy.genfromtxt('kaggle_dsl_scikit_learn/test.csv', delimiter=',')
 
-        loss.back_propagation(perform_gradient_descent=True)
+    prediction_probabilities = []
+    low_confidence_indexes = []
+    for index, x in enumerate(test_x):
+        y = mfcn(x).data
+        prediction_probabilities.append(y)
+
+        if 0.25 < abs(y) < 0.75:
+            low_confidence_indexes.append(index)
+
+    predictions = apply_binary_threshold(prediction_probabilities, 0.5)
+    print(predictions)
+
+    numpy.savetxt(f'nn_predictions{start_time}.csv', predictions, delimiter=',', fmt='%d')
+
+    low_confidence_y = {}
+    for index in low_confidence_indexes:
+        low_confidence_y[index] = test_x[index]
+
+    xgboost_model: XGBClassifier = xgboost(x_train, x_validate, y_train, y_validate)
+
+    xgb_predictions = {}
+    for index in low_confidence_y.keys():
+        x = low_confidence_y[index]
+        # x is (40, )
+        # xgboost wants (1, 40)
+        reshaped_x = x.reshape(1, -1)
+        xgb_prediction = xgboost_model.predict(reshaped_x)[0]
+        xgb_predictions[index] = xgb_prediction
+
+        # compare the two models on low confidence examples
+        nn_prediction = predictions[index]
+        print(f"Index: {index} - nn: {nn_prediction}; xgb: {xgb_prediction}")
+
+        predictions[index] = xgb_prediction
+
+    print(predictions)
+    numpy.savetxt(f'xgb_predictions{start_time}.csv', predictions, delimiter=',', fmt='%d')
+
+
+
+
+
 
     # draw_dot(out).view()
-
+    print(f"Done in {time.time() - start_time} seconds")
 
