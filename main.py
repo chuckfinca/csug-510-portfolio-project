@@ -1,16 +1,11 @@
 import json
 import random
 import time
-import sklearn.model_selection
 import sklearn.datasets
 from enum import Enum
-
 from xgboost import XGBClassifier
-# read data
-
 import matplotlib.pyplot
 import numpy
-from graphviz import Digraph
 
 
 class Operation(Enum):
@@ -262,40 +257,6 @@ def topological_sort(value: Value) -> ['Value']:
     return topologically_sorted_graph
 
 
-def trace(root):
-    # builds a set of all nodes and edges in a graph
-    nodes, edges = set(), set()
-
-    def build(v):
-        if v not in nodes:
-            nodes.add(v)
-            for child in v.children:
-                edges.add((child, v))
-                build(child)
-    build(root)
-    return nodes, edges
-
-def draw_dot(root, file_name: str = None):
-    dot = Digraph(graph_attr={'rankdir': 'LR'}) # LR = left to right, default format is pdf
-    if file_name is not None:
-        dot.filename = file_name
-    nodes, edges = trace(root)
-    for n in nodes:
-        uid = str(id(n))
-        # for any value in the graph, create a rectangular ('record') node for it
-        dot.node(name = uid, label = "{ %s | data %.4f | gradient %.4f }" % (n.label, n.data, n.gradient_with_respect_to_loss), shape='record')
-        if n.operation:
-            # if this value is a result of some operation, create an op node for it
-            dot.node(name = uid + n.operation.value, label = n.operation.value)
-            # and connect this node to it
-            dot.edge (uid + n.operation.value, uid)
-    for n1, n2 in edges:
-        # connect n1 to the op node of n2
-        dot.edge(str(id(n1)), str(id(n2)) + n2.operation.value)
-
-    return dot
-
-
 class Neuron:
 
     def __init__(self, inputs, state=None):
@@ -304,8 +265,8 @@ class Neuron:
         else:
             # initialize n weights as random numbers between -1 and 1
             # where n is the number of inputs
-            self.weights = [Value(random.uniform(-1,1), label=f"w{i}") for i in range(inputs)]
-            self.bias = Value(random.uniform(-1, 1), label="b")
+            self.weights = [Value(random.uniform(-0.15,0.15), label=f"w{i}") for i in range(inputs)]
+            self.bias = Value(random.uniform(-0.15,0.15), label="b")
 
     def __call__(self, inputs):
         # w * x + b
@@ -415,7 +376,9 @@ class MultilayerFullyConnectedNetwork:
     def __call__(self, x):
         for layer in self.layers:
             x = layer(x)
-        return x
+
+        # convert to probability (between 0-1) and return
+        return (x + 1) / 2
 
 
     def __getstate__(self):
@@ -454,8 +417,8 @@ class MultilayerFullyConnectedNetwork:
 def compute_validation_loss(network, validation_inputs, validation_targets):
     total_loss = 0
     for x, y in zip(validation_inputs, validation_targets):
-        prediction = network(x)
-        loss = prediction.binary_cross_entropy(y)
+        out = network(x)
+        loss = out.binary_cross_entropy(y)
         total_loss += loss.data
     average_loss = total_loss / len(validation_inputs)
     return average_loss
@@ -487,35 +450,34 @@ def xgboost(x_train, x_validate, y_train, y_validate):
             number_correct += 1
 
     accuracy = number_correct / len(x_validate)
-    print(f"Accuracy: {accuracy * 100}%")
-
-    weight_booster = model.get_booster().get_score(importance_type='weight')
-    gain_booster = model.get_booster().get_score(importance_type='gain')
-    cover_booster = model.get_booster().get_score(importance_type='cover')
-    # weight_booster = model.get_booster().get_score(importance_type='weight')
-    print("asdf")
+    print(f"XGBoost validation accuracy: {accuracy * 100}%")
 
     return model
 
 
-def train(model, x_train, x_validate, y_train, y_validate):
+def train(model, epochs, step_size):
+
+    training_data_x = numpy.genfromtxt('kaggle_dsl_scikit_learn/train.csv', delimiter=',')
+    training_data_y = numpy.genfromtxt('kaggle_dsl_scikit_learn/trainLabels.csv', delimiter=',')
+
+    x_train, x_validate, y_train, y_validate = sklearn.model_selection.train_test_split(training_data_x, training_data_y, test_size=0.10, random_state=42)
 
     training_losses = []
     validation_losses = []
 
-    for epoch in range(4):
+    for epoch in range(epochs):
         epoch_start = time.time()
 
         total_epoch_loss = 0
 
         # Training loop
         for (index, x) in enumerate(x_train):
-            y = y_train[index]
+            y_true = y_train[index]
 
-            out = model(x)
-            loss = out.binary_cross_entropy(y)
+            y_pred = model(x)
+            loss = y_pred.binary_cross_entropy(y_true)
 
-            loss.back_propagation(perform_gradient_descent=True, step_size=0.00001)
+            loss.back_propagation(perform_gradient_descent=True, step_size=step_size)
 
             total_epoch_loss += loss.data
 
@@ -529,66 +491,84 @@ def train(model, x_train, x_validate, y_train, y_validate):
         validation_loss = compute_validation_loss(model, x_validate, y_validate)
         validation_losses.append(validation_loss)
 
-        print(
-            f"Epoch {epoch + 1}, Training Loss: {total_epoch_loss}, Validation Loss: {validation_loss} in {time.time() - epoch_start} seconds")
+        model_name = f"network_{step_size}_{epoch}_{round(validation_loss,2)}.txt"
+        print(f"Epoch {epoch + 1}, Training Loss: {total_epoch_loss}, Validation Loss: {validation_loss} in {time.time() - epoch_start} seconds - {model_name}")
+        model.save_to_file(model_name)
 
-    model.save_to_file(f"network_{time.time()}.txt")
+    xgboost_model: XGBClassifier = xgboost(x_train, x_validate, y_train, y_validate)
+    xgboost_model.save_model('xgb_model.json')
+
     plot_losses(training_losses, validation_losses)
 
 
-def apply_binary_threshold(probabilities, threshold):
-    predictions = []
-    for probability in probabilities:
+def apply_binary_threshold(probability, threshold):
+    if isinstance(probability, list):
+        predictions = []
+        for p in probability:
+            predictions.append(apply_binary_threshold(p, threshold))
+        return predictions
+    else:
         if probability >= threshold:
-            predictions.append(1)
+            return 1
         else:
-            predictions.append(0)
-    return predictions
+            return 0
 
+
+def save_for_kaggle_submission(predictions, file_name):
+    # Create a 2D array with indices and data
+    indexed_data = numpy.column_stack((numpy.arange(1,len(predictions) + 1), predictions))
+    numpy.savetxt(file_name, indexed_data, delimiter=',', fmt='%d', header='Id,Solution', comments='')
 
 
 if __name__ == '__main__':
 
     start_time = time.time()
 
-    training_data_x = numpy.genfromtxt('kaggle_dsl_scikit_learn/train.csv', delimiter=',')
-    training_data_y = numpy.genfromtxt('kaggle_dsl_scikit_learn/trainLabels.csv', delimiter=',')
+    # load the ANN from disk
+    ann = MultilayerFullyConnectedNetwork.load_from_file("network_4e-05_0_1.22.txt")
+    # or create your own
+    # ann = MultilayerFullyConnectedNetwork(x_train.shape[0], [2, 3, 5, 4, 1])
+    # ann = MultilayerFullyConnectedNetwork(x_train.shape[0], [50, 20, 1])
 
-    x_train, x_validate, y_train, y_validate = sklearn.model_selection.train_test_split(training_data_x, training_data_y, test_size=0.10, random_state=42)
+    train_first = False
+    if train_first:
+        epochs = 1
+        step_size = 0.00001
+        train(ann, epochs, step_size)
 
-    mfcn = MultilayerFullyConnectedNetwork.load_from_file("network_1705010672.034891.txt")
-    # mfcn = MultilayerFullyConnectedNetwork(x_train.shape[0], [40, 100, 100, 20, 1])
+    cvs_to_test_path = 'kaggle_dsl_scikit_learn/test.csv'
+    test_x = numpy.genfromtxt(cvs_to_test_path, delimiter=',')
 
-    # train(mfcn, x_train, x_validate, y_train, y_validate)
-
-
-    test_x = numpy.genfromtxt('kaggle_dsl_scikit_learn/test.csv', delimiter=',')
-
-    prediction_probabilities = []
+    predictions = []
     low_confidence_indexes = []
     for index, x in enumerate(test_x):
-        y = mfcn(x).data
-        prediction_probabilities.append(y)
+        out = ann(x).data
 
-        if 0.25 < abs(y) < 0.75:
+        if 0.25 < abs(out) < 0.75:
             low_confidence_indexes.append(index)
 
-    predictions = apply_binary_threshold(prediction_probabilities, 0.5)
-    print(predictions)
+        y = apply_binary_threshold(out, 0.5)
+        predictions.append(y)
 
-    numpy.savetxt(f'nn_predictions{start_time}.csv', predictions, delimiter=',', fmt='%d')
+        if index % 1000 == 0:
+            print(f"Testing {index / len(test_x) * 100}% done")
+
+    save_for_kaggle_submission(predictions, f'nn_predictions{start_time}.csv')
+
+    print(f"NN test completed in {time.time() - start_time} seconds")
 
     low_confidence_y = {}
     for index in low_confidence_indexes:
         low_confidence_y[index] = test_x[index]
 
-    xgboost_model: XGBClassifier = xgboost(x_train, x_validate, y_train, y_validate)
+    xgboost_model = XGBClassifier()
+    xgboost_model.load_model('xgb_model.json')
 
     xgb_predictions = {}
     for index in low_confidence_y.keys():
         x = low_confidence_y[index]
-        # x is (40, )
-        # xgboost wants (1, 40)
+
+        # x is (40, ), xgboost wants (1, 40)
         reshaped_x = x.reshape(1, -1)
         xgb_prediction = xgboost_model.predict(reshaped_x)[0]
         xgb_predictions[index] = xgb_prediction
@@ -600,13 +580,7 @@ if __name__ == '__main__':
         predictions[index] = xgb_prediction
 
     print(predictions)
-    numpy.savetxt(f'xgb_predictions{start_time}.csv', predictions, delimiter=',', fmt='%d')
+    save_for_kaggle_submission(predictions, f'xgb_predictions{start_time}.csv')
 
-
-
-
-
-
-    # draw_dot(out).view()
     print(f"Done in {time.time() - start_time} seconds")
 
